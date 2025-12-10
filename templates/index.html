@@ -2,48 +2,78 @@
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>Hospital Resource Allocator</title>
+  <title>OS Hospital Resource Allocator</title>
   <style>
-    body { font-family: Arial, sans-serif; max-width: 900px; margin: 24px auto; }
-    .card { border: 1px solid #ddd; padding: 12px; margin-bottom: 12px; border-radius: 8px; }
-    .row { display:flex; gap:8px; align-items:center; }
-    button { padding:6px 10px; }
-    table { width:100%; border-collapse: collapse; margin-top:8px; }
-    th, td { border:1px solid #eee; padding:6px; text-align:left; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 1000px; margin: 24px auto; background-color: #f4f4f9; color: #333; }
+    h1 { text-align: center; color: #2c3e50; }
+    .card { background: white; border: 1px solid #ddd; padding: 20px; margin-bottom: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    .row { display:flex; gap:12px; align-items:flex-end; }
+    .input-group { display: flex; flex-direction: column; }
+    label { font-size: 12px; font-weight: bold; margin-bottom: 4px; color: #666; }
+    input, select, button { padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+    button { background-color: #3498db; color: white; border: none; cursor: pointer; font-weight: bold; }
+    button:hover { background-color: #2980b9; }
+    table { width:100%; border-collapse: collapse; margin-top:12px; font-size: 14px; }
+    th, td { border:1px solid #eee; padding:8px; text-align:left; }
+    th { background-color: #f8f9fa; }
+    .status-free { background-color: #d4edda; color: #155724; }
+    .status-busy { background-color: #f8d7da; color: #721c24; }
   </style>
 </head>
 <body>
-  <h1>Hospital Resource Allocator</h1>
+  <h1>🏥 Hospital Resource Allocator</h1>
+  <p style="text-align:center; color: #666;">Demonstrating OS Priority Scheduling, Aging, and Resource Management</p>
 
   <div class="card">
-    <h3>Create Request</h3>
+    <h3>📝 New Patient Request</h3>
     <div class="row">
-      <input id="name" placeholder="Patient name" />
-      <select id="priority">
-        <option value="1">1 — Highest (critical)</option>
-        <option value="2">2</option>
-        <option value="3" selected>3 — Medium</option>
-        <option value="4">4</option>
-        <option value="5">5 — Low</option>
-      </select>
-      <input id="est_minutes" type="number" min="10" value="1" />
-      <button onclick="createRequest()">Request</button>
+      <div class="input-group">
+        <label>Patient Name</label>
+        <input id="name" placeholder="John Doe" />
+      </div>
+      
+      <div class="input-group">
+        <label>Required Resource</label>
+        <select id="resource_type">
+            <option value="ICU_BED">ICU Bed</option>
+            <option value="VENTILATOR">Ventilator</option>
+        </select>
+      </div>
+
+      <div class="input-group">
+        <label>Priority</label>
+        <select id="priority">
+            <option value="1">P1 — Critical (High)</option>
+            <option value="2">P2 — Urgent</option>
+            <option value="3" selected>P3 — Standard</option>
+            <option value="4">P4 — Minor</option>
+            <option value="5">P5 — Routine (Low)</option>
+        </select>
+      </div>
+
+      <div class="input-group">
+        <label>Est. Duration (mins)</label>
+        <input id="est_minutes" type="number" min="10" value="60" style="width: 80px;" />
+      </div>
+
+      <button onclick="createRequest()">Submit Request</button>
     </div>
   </div>
 
   <div class="card">
-    <h3>Resources</h3>
-    <div id="resources"></div>
+    <h3>⚠️ Waiting Queue (Scheduler Ready Queue)</h3>
+    <p style="font-size: 12px; color: #666;">Note: Priority "ages" (improves) every 30 seconds of waiting.</p>
+    <div id="queue"></div>
   </div>
 
   <div class="card">
-    <h3>Current Allocations</h3>
+    <h3>✅ Active Allocations</h3>
     <div id="allocations"></div>
   </div>
 
   <div class="card">
-    <h3>Pending Queue</h3>
-    <div id="queue"></div>
+    <h3>🏥 System Resources</h3>
+    <div id="resources"></div>
   </div>
 
 <script src="/static/main.js"></script>
