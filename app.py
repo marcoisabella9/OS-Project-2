@@ -1,23 +1,27 @@
 import sqlite3
 import threading
 import time
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 from flask import Flask, g, jsonify, request, render_template
 
 DATABASE = 'hospital.db'
-SCHEDULER_INTERVAL = 5  # seconds between allocation cycles
-AGING_INTERVAL = 60     # seconds to reduce effective priority (aging)
-MAX_PRIORITY = 1
-MIN_PRIORITY = 5
+SCHEDULER_INTERVAL = 5  # seconds
+AGING_INTERVAL = 30     # Decrease priority score (increase importance) every 30s of waiting
+MIN_PRIORITY = 5        # Lowest urgency
+MAX_PRIORITY = 1        # Highest urgency
 
+# Resource configuration
 RESOURCE_TYPES = {
-    'ICU_BED': 3,
+    'ICU_BED': 5,
     'VENTILATOR': 2
 }
 
 app = Flask(__name__)
-db_lock = threading.Lock()          # protects sqlite writes (shared resource)
-allocation_lock = threading.Lock()  # protects in-memory allocation ops
+db_lock = threading.Lock()
+allocation_lock = threading.Lock()
+
+# --- Database Setup & Helpers ---
 
 def get_db():
     db = getattr(g, '_database', None)
@@ -33,54 +37,47 @@ def close_connection(exception):
         db.close()
 
 def init_db():
-    conn = sqlite3.connect(DATABASE)
-    with open('schema.sql', 'r') as f:
-        sql = f.read()
-    conn.executescript(sql)
-    conn.commit()
-    conn.close()
+    with db_lock:
+        conn = sqlite3.connect(DATABASE)
+        with open('schema.sql', 'r') as f:
+            sql = f.read()
+        conn.executescript(sql)
+        conn.commit()
+        conn.close()
     seed_resources()
 
 def seed_resources():
-    conn = sqlite3.connect(DATABASE)
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) as c FROM resources")
-    if cur.fetchone()[0] == 0:
-        idx = 1
-        for rtype, count in RESOURCE_TYPES.items():
-            for i in range(count):
-                cur.execute("INSERT INTO resources (resource_type, label, status) VALUES (?, ?, ?)",
-                            (rtype, f"{rtype}-{idx}", "free"))
-                idx += 1
-        conn.commit()
-    conn.close()
-
-# Utility DB helpers
-def db_execute(query, params=(), commit=False):
     with db_lock:
         conn = sqlite3.connect(DATABASE)
         cur = conn.cursor()
-        cur.execute(query, params)
-        if commit:
+        cur.execute("SELECT COUNT(*) FROM resources")
+        if cur.fetchone()[0] == 0:
+            print("[System] Seeding resources...")
+            id_counter = 1
+            for rtype, count in RESOURCE_TYPES.items():
+                for i in range(count):
+                    label = f"{rtype}-{id_counter}"
+                    cur.execute("INSERT INTO resources (resource_type, label, status) VALUES (?, ?, ?)",
+                                (rtype, label, "free"))
+                    id_counter += 1
             conn.commit()
-            last = cur.lastrowid
-            conn.close()
-            return last
-        rows = cur.fetchall()
         conn.close()
-        return rows
 
-def db_query_rows(query, params=()):
+def db_query(query, params=(), one=False, commit=False):
     with db_lock:
         conn = sqlite3.connect(DATABASE)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
         cur.execute(query, params)
-        rows = cur.fetchall()
+        if commit:
+            conn.commit()
+            rv = cur.lastrowid
+        else:
+            rv = cur.fetchall()
         conn.close()
-        return rows
+        return (rv[0] if rv else None) if one else rv
 
-# API endpoints
+# --- API Endpoints ---
 
 @app.route('/')
 def index():
@@ -91,117 +88,154 @@ def create_request():
     data = request.json
     name = data.get('name', 'Anonymous')
     priority = int(data.get('priority', 3))
+    # Ensure priority is within bounds
+    priority = max(MAX_PRIORITY, min(priority, MIN_PRIORITY))
+    
+    req_type = data.get('resource_type', 'ICU_BED')
     est_minutes = int(data.get('est_minutes', 60))
-    priority = max(MIN_PRIORITY, min(MAX_PRIORITY if False else priority, MIN_PRIORITY))  # ensure 1..5
-    q = "INSERT INTO patient_requests (name, priority, est_minutes, status) VALUES (?, ?, ?, ?)"
-    rid = db_execute(q, (name, priority, est_minutes, 'queued'), commit=True)
-    return jsonify({"request_id": rid}), 201
+
+    q = """INSERT INTO patient_requests 
+           (name, priority, required_resource, est_minutes, status) 
+           VALUES (?, ?, ?, ?, ?)"""
+    rid = db_query(q, (name, priority, req_type, est_minutes, 'queued'), commit=True)
+    return jsonify({"request_id": rid, "status": "queued"}), 201
 
 @app.route('/api/requests', methods=['GET'])
 def list_requests():
-    rows = db_query_rows("SELECT * FROM patient_requests ORDER BY requested_at ASC")
+    rows = db_query("SELECT * FROM patient_requests ORDER BY requested_at ASC")
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/resources', methods=['GET'])
 def list_resources():
-    rows = db_query_rows("SELECT * FROM resources ORDER BY id")
+    rows = db_query("SELECT * FROM resources ORDER BY resource_type, id")
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/allocations', methods=['GET'])
 def list_allocations():
-    rows = db_query_rows("SELECT a.*, p.name, p.priority FROM allocations a JOIN patient_requests p ON p.id = a.request_id WHERE a.released_at IS NULL")
+    q = """SELECT a.*, p.name, p.priority, p.required_resource 
+           FROM allocations a 
+           JOIN patient_requests p ON p.id = a.request_id 
+           WHERE a.released_at IS NULL"""
+    rows = db_query(q)
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/release', methods=['POST'])
 def release_allocation():
     data = request.json
     allocation_id = int(data.get('allocation_id'))
+    
     with allocation_lock:
-        # mark allocation released
-        db_execute("UPDATE allocations SET released_at = CURRENT_TIMESTAMP WHERE id = ?", (allocation_id,), commit=True)
-        # get the allocation row to know resource id
-        rows = db_query_rows("SELECT resource_id, request_id FROM allocations WHERE id = ?", (allocation_id,))
-        if rows:
-            res_id = rows[0]['resource_id']
-            req_id = rows[0]['request_id']
-            db_execute("UPDATE resources SET status = 'free' WHERE id = ?", (res_id,), commit=True)
-            db_execute("UPDATE patient_requests SET status = 'completed', released_at = CURRENT_TIMESTAMP WHERE id = ?", (req_id,), commit=True)
+        # 1. Mark allocation as released
+        db_query("UPDATE allocations SET released_at = CURRENT_TIMESTAMP WHERE id = ?", (allocation_id,), commit=True)
+        
+        # 2. Get details to free the specific resource
+        row = db_query("SELECT resource_id, request_id FROM allocations WHERE id = ?", (allocation_id,), one=False)
+        if row:
+            res_id = row[0]['resource_id']
+            req_id = row[0]['request_id']
+            
+            # 3. Free the resource
+            db_query("UPDATE resources SET status = 'free' WHERE id = ?", (res_id,), commit=True)
+            # 4. Mark request completed
+            db_query("UPDATE patient_requests SET status = 'completed', released_at = CURRENT_TIMESTAMP WHERE id = ?", (req_id,), commit=True)
+            
+            print(f"[Scheduler] Resource {res_id} released.")
+
     return jsonify({"status": "released"})
 
-# Scheduler core
-def scheduler_loop():
-    print("[Scheduler] started")
+# --- OS Principles: Scheduler Logic ---
+
+def calculate_effective_priority(base_priority, requested_at_str):
+    """
+    Implements 'Aging': A technique to prevent starvation.
+    As waiting time increases, the effective priority number decreases (approaching 1).
+    """
+    req_time = datetime.strptime(requested_at_str, "%Y-%m-%d %H:%M:%S")
+    wait_seconds = (datetime.utcnow() - req_time).total_seconds()
+    
+    # For every AGING_INTERVAL seconds, improve priority by 1
+    priority_boost = int(wait_seconds // AGING_INTERVAL)
+    
+    # Effective priority cannot go better than 1 (MAX_PRIORITY)
+    effective = max(MAX_PRIORITY, base_priority - priority_boost)
+    return effective, wait_seconds
+
+def run_allocation_cycle():
+    """
+    The Core OS Allocator. 
+    1. Looks for free resources.
+    2. Looks for queued processes (requests).
+    3. Matches them based on Resource Affinity (Type) and Priority.
+    """
+    with allocation_lock:
+        # 1. Identify what is free
+        free_resources_rows = db_query("SELECT * FROM resources WHERE status = 'free'")
+        if not free_resources_rows:
+            return # No resources available, CPU/Scheduler yields
+
+        # Group free resources by type: {'ICU_BED': [row, row], 'VENTILATOR': [row]}
+        free_map = {}
+        for r in free_resources_rows:
+            rtype = r['resource_type']
+            if rtype not in free_map:
+                free_map[rtype] = []
+            free_map[rtype].append(r)
+
+        # 2. Identify who is waiting
+        queued_rows = db_query("SELECT * FROM patient_requests WHERE status = 'queued'")
+        if not queued_rows:
+            return
+
+        # 3. Calculate Effective Priority for all waiting requests
+        waiting_list = []
+        for req in queued_rows:
+            eff_p, wait_sec = calculate_effective_priority(req['priority'], req['requested_at'])
+            waiting_list.append({
+                'data': req,
+                'eff_priority': eff_p,
+                'wait_seconds': wait_sec
+            })
+
+        # 4. Sort waiting list: 
+        # Primary Key: Effective Priority (Ascending -> 1 is best)
+        # Secondary Key: Wait Time (Descending -> longest wait first)
+        waiting_list.sort(key=lambda x: (x['eff_priority'], -x['wait_seconds']))
+
+        # 5. Allocation Logic
+        for item in waiting_list:
+            req = item['data']
+            needed_type = req['required_resource']
+
+            # Do we have a free resource of this specific type?
+            if needed_type in free_map and len(free_map[needed_type]) > 0:
+                # Pop the first available resource of this type
+                resource = free_map[needed_type].pop(0)
+                
+                # EXECUTE ALLOCATION
+                print(f"[Scheduler] Allocating {resource['label']} to {req['name']} (Eff Pri: {item['eff_priority']})")
+                
+                db_query("UPDATE resources SET status = 'in_use' WHERE id = ?", (resource['id'],), commit=True)
+                db_query("UPDATE patient_requests SET status = 'allocated', allocated_at = CURRENT_TIMESTAMP WHERE id = ?", (req['id'],), commit=True)
+                db_query("INSERT INTO allocations (request_id, resource_type, resource_id) VALUES (?, ?, ?)",
+                         (req['id'], resource['resource_type'], resource['id']), commit=True)
+
+def scheduler_thread():
+    print("[Scheduler] Daemon started...")
     while True:
         try:
             run_allocation_cycle()
         except Exception as e:
-            print("[Scheduler] error:", e)
+            print(f"[Scheduler Error] {e}")
         time.sleep(SCHEDULER_INTERVAL)
 
-def effective_priority(original_priority, waiting_seconds):
-    """
-    Aging: every AGING_INTERVAL seconds of waiting improves effective priority by 1 (towards 1).
-    Lower number => higher priority.
-    """
-    bonus = waiting_seconds // AGING_INTERVAL
-    effective = max(1, original_priority - int(bonus))
-    return effective
-
-def run_allocation_cycle():
-    with allocation_lock:
-        now = datetime.utcnow()
-        # 1) find free resources
-        free_resources = db_query_rows("SELECT * FROM resources WHERE status = 'free' ORDER BY resource_type, id")
-        if not free_resources:
-            return
-
-        # 2) find queued requests
-        rows = db_query_rows("SELECT * FROM patient_requests WHERE status = 'queued' ORDER BY requested_at ASC")
-        queued = []
-        for r in rows:
-            req_time = datetime.strptime(r['requested_at'], "%Y-%m-%d %H:%M:%S")
-            waiting = (now - req_time).total_seconds()
-            eff = effective_priority(r['priority'], waiting)
-            queued.append({
-                'id': r['id'],
-                'name': r['name'],
-                'priority': r['priority'],
-                'effective_priority': eff,
-                'waiting': waiting,
-                'requested_at': r['requested_at'],
-                'est_minutes': r['est_minutes']
-            })
-        if not queued:
-            return
-
-        # 3) sort queued by effective_priority then FIFO
-        queued.sort(key=lambda x: (x['effective_priority'], x['requested_at']))
-
-        # 4) allocate: try to match resource types in round-robin or all-purpose assignment
-        # For simplicity, assume all requests can use any ICU_BED resource for now.
-        for req in queued:
-            if not free_resources:
-                break
-            # choose a free resource (simple: first free)
-            chosen = free_resources.pop(0)
-            # perform allocation
-            db_execute("INSERT INTO allocations (request_id, resource_type, resource_id) VALUES (?, ?, ?)",
-                       (req['id'], chosen['resource_type'], chosen['id']), commit=True)
-            db_execute("UPDATE resources SET status = 'in_use' WHERE id = ?", (chosen['id'],), commit=True)
-            db_execute("UPDATE patient_requests SET status = 'allocated', allocated_at = CURRENT_TIMESTAMP WHERE id = ?", (req['id'],), commit=True)
-            print(f"[Scheduler] Allocated req {req['id']} -> resource {chosen['label']}")
-
-# start scheduler thread on app start
-def start_scheduler_in_background():
-    t = threading.Thread(target=scheduler_loop, daemon=True)
-    t.start()
-
 if __name__ == '__main__':
-    import os
     if not os.path.exists(DATABASE):
         init_db()
     else:
-        # ensure resources seeded if DB exists but empty
         seed_resources()
-    start_scheduler_in_background()
-    app.run(debug=True, threaded=True)
+    
+    # Start the scheduler in background
+    t = threading.Thread(target=scheduler_thread, daemon=True)
+    t.start()
+    
+    app.run(debug=True, threaded=True, port=5000)
