@@ -86,3 +86,83 @@ This project is significant because we can apply Scheduling algorithms to make i
     * Dual-lock concurrency control
     * Prevents race conditions and data corruption
     * Ensures atomic allocation operations
+
+## Execution Results and Analysis
+
+<h4>1. Resource Utilization and Contention</h4>
+Our analysis focused on resources allocated versus queue growth under high demand scenarios.
+We configured the system with a scarcity of Ventilators (2 units) compared to ICU Beds (5 units) to force contention.
+<ul>
+    <li><strong>Ventilator Allocation:</strong> With 5 patient requests for Ventilators, only 2 were allocated immediately. The remaining 3 entered the Waiting Queue, demonstrating the <strong>Blocking</strong> state analogous to a process waiting on a full semaphore.</li>
+    <li><strong>ICU Bed Allocation:</strong> Requests for ICU Beds were fulfilled instantly, confirming the scheduler's ability to handle resource affinity and isolation (i.e., the shortage of one resource type does not block the use of another).</li>
+</ul>
+
+<h4>2. Priority Scheduling and Throughput</h4>
+<p>We analyzed the impact of our custom Priority Scheduling algorithm (incorporating Aging) on the order of service:</p>
+<table border="1" style="width: 100%; text-align: left;">
+    <thead>
+        <tr>
+            <th>Request</th>
+            <th>Base Priority (P)</th>
+            <th>Order of Arrival</th>
+            <th>Order of Allocation</th>
+            <th>Justification (OS Principle)</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td>Req F</td>
+            <td>1 (Highest)</td>
+            <td>Last</td>
+            <td>1st</td>
+            <td><strong>Strict Priority Scheduling:</strong> P1 preempts all lower-priority queued requests.</td>
+        </tr>
+        <tr>
+            <td>Req C</td>
+            <td>3 (Medium)</td>
+            <td>2nd</td>
+            <td>2nd</td>
+            <td>FIFO among equal priorities (after P1 is served).</td>
+        </tr>
+        <tr>
+            <td>Req E</td>
+            <td>5 (Lowest)</td>
+            <td>3rd</td>
+            <td>3rd (after aging)</td>
+            <td><strong>Aging:</strong> Was allocated before new P3 requests due to accumulated wait time.</td>
+        </tr>
+    </tbody>
+</table>
+
+<h4>3. Implementation of Aging to Prevent Starvation</h4>
+<p>The Aging mechanism successfully demonstrated how to prevent "starvation" of low-priority patients. The scheduler was configured to boost the effective priority by 1 (i.e., P5 becomes P4) every 30 seconds of waiting.</p>
+<ul>
+    <li>A <strong>Priority 5</strong> patient (Req E) was observed to have an <strong>Effective Priority</strong> change from 5 to 4 after 30 seconds, and 4 to 3 after 60 seconds.</li>
+    <li>This change ensured that, when a resource became free, the aging patient was prioritized over a newly arriving P3 patient, guaranteeing eventual resource access for all waiting patients.</li>
+</ul>
+
+## Conclusions
+
+<h3>Summary of Findings</h3>
+<p>The Hospital Resource Allocator effectively models essential OS mechanisms for managing finite resources in a concurrent environment. We successfully implemented:</p>
+<ol>
+    <li><strong>Resource Management:</strong> Tracking the state (free/in_use) of individual, distinct resources (ICU Beds, Ventilators).</li>
+    <li><strong>Concurrency Control:</strong> Using Python's <code>threading.Lock</code> to protect shared resources (the SQLite database and the allocation routine) from race conditions.</li>
+    <li><strong>Scheduling:</strong> A custom, preemptive Priority Scheduling algorithm based on patient urgency (1-5).</li>
+    <li><strong>Fairness:</strong> An <strong>Aging</strong> mechanism to dynamically adjust priority, ensuring fairness and preventing resource starvation for low-urgency patients.</li>
+</ol>
+
+<h3>Project Issues and Challenges</h3>
+<ul>
+    <li><strong>Real-Time Simulation:</strong> The use of `time.sleep()` in the scheduler thread limits the project's ability to handle high-frequency events, as the minimum scheduler interval is 5 seconds. A true high-performance system would require asynchronous task processing.</li>
+    <li><strong>Deadlock Prevention:</strong> The current model only allocates a single resource type per request. Implementing multi-resource requests (e.g., patient needs a Bed AND a Ventilator) would introduce the risk of <strong>Deadlock</strong>, which was not addressed in this version.</li>
+    <li><strong>Persistence and Rollback:</strong> The system relies on atomic database updates for state changes. A failure during a critical multi-step allocation or release sequence could leave the system in an inconsistent state, highlighting the need for true database transactions and robust error handling.</li>
+</ul>
+
+<h3>Application of Course Learning</h3>
+<p>This project served as a direct application of several core Operating Systems course topics:</p>
+<ul>
+    <li><strong>Processes and Threads:</strong> The scheduler runs as a separate <strong>Daemon Thread</strong>, allowing it to execute concurrently with the main Flask web server thread, simulating a kernel service running alongside user processes.</li>
+    <li><strong>Synchronization and Mutual Exclusion:</strong> The `db_lock` and `allocation_lock` objects are used as <strong>Mutexes</strong> (Mutual Exclusion locks) to ensure only one thread modifies the shared database or allocation state at any given time, preventing data corruption and race conditions.</li>
+    <li><strong>Scheduling Algorithms:</strong> Implementation of a complex priority-based scheduler, which is a hybrid of <strong>Priority Scheduling</strong> and <strong>First-Come, First-Served (FCFS)</strong> (used as a tie-breaker), with the added complexity of the <strong>Aging</strong> technique.</li>
+</ul>
